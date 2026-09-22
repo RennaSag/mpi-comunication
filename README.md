@@ -27,7 +27,7 @@ modelo cliente/servidor da **Seção 11.9 (Establishing Communication)**, que de
 | App abre                        | `MPI_Init_thread(MPI_THREAD_MULTIPLE)`                        | 11.2, 11.6      |
 | Celular do hotspot              | `MPI_Open_port` → mostra o `port_name` → `MPI_Comm_accept`    | 11.9.1, 11.9.2  |
 | Celular conectado ao hotspot    | `MPI_Comm_connect(port_name)`                                 | 11.9.3          |
-| Toque na fogueira               | `MPI_Send(buf={3 nuvens, nº}, 2, MPI_INT, dest=0, tag=1, intercomm)` | 3.2.1    |
+| Toque na fogueira               | `MPI_Send(buf={1 nuvem, nº}, 2, MPI_INT, dest=0, tag=1, intercomm)` | 3.2.1    |
 | Espera por sinais               | `MPI_Irecv(..., MPI_ANY_SOURCE, MPI_ANY_TAG, intercomm)` + `MPI_Wait` | 3.7.2, 3.7.3 |
 | Ler o sinal recebido            | `status.MPI_TAG`, `status.MPI_SOURCE`, `MPI_Get_count`        | 3.2.5           |
 | Sair                            | `MPI_Send(tag=2 "adeus")`, `MPI_Cancel`, `MPI_Comm_disconnect`, `MPI_Close_port`, `MPI_Finalize` | 3.8.4, 11.9, 11.2.2 |

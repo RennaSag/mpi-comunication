@@ -42,7 +42,7 @@ class MainActivity : Activity() {
         const val TAG_FUMACA = 1
         const val TAG_ADEUS = 2
         /** Quantas nuvens de fumaça cada sinal tem (primeiro inteiro da mensagem). */
-        const val NUVENS_POR_SINAL = 3
+        const val NUVENS_POR_SINAL = 1
         /** Rank do outro celular no grupo remoto do inter-comunicador. */
         const val OUTRO_CELULAR = 0
     }

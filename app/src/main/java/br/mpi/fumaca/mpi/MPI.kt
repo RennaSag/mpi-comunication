@@ -5,6 +5,8 @@ package br.mpi.fumaca.mpi
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
@@ -23,8 +25,12 @@ import kotlin.random.Random
  * MPI_COMM_WORLD de tamanho 1. Os dois processos foram iniciados de forma independente,
  * por isso a comunicação é estabelecida pelo modelo cliente/servidor da Seção 11.9:
  *
- *   servidor: MPI_Open_port -> MPI_Comm_accept  (celular que roteia o hotspot)
- *   cliente : MPI_Comm_connect(port_name)        (celular conectado ao hotspot)
+ *   servidor: MPI_Open_port -> MPI_Publish_name -> MPI_Comm_accept
+ *   cliente : MPI_Lookup_name -> MPI_Comm_connect(port_name)
+ *
+ * Há dois transportes, escolhidos pelo port_name:
+ *   "ip:porta"                   TCP direto (os dois na mesma rede / hotspot)
+ *   "mqtts://broker:porta/ID"    relay pela internet (redes diferentes, atrás de NAT; Relay.kt)
  *
  * O resultado é um inter-comunicador em que cada lado tem rank 0 e o grupo remoto
  * tem tamanho 1; depois disso toda a troca usa comunicação ponto-a-ponto (Capítulo 3).
@@ -59,7 +65,9 @@ object MPI {
     const val ERR_OTHER = 16
     const val ERR_INTERN = 17
     const val ERR_INFO = 28
+    const val ERR_NAME = 33
     const val ERR_PORT = 38
+    const val ERR_SERVICE = 41
 
     // Tipos de dados predefinidos (Tabela 3.2).
     val INT = Datatype(1, "MPI_INT", 4)
@@ -75,6 +83,8 @@ object MPI {
     @Volatile private var initialized = false
     @Volatile private var finalized = false
     private val openPorts = ConcurrentHashMap<String, ServerSocket>()
+    private val relayPorts = ConcurrentHashMap<String, RelayPort>()
+    private val publishedNames = ConcurrentHashMap<String, String>()
     private val liveComms = ConcurrentHashMap.newKeySet<Comm>()
 
     lateinit var COMM_WORLD: Comm
@@ -107,7 +117,9 @@ object MPI {
     fun Finalize() {
         checkInit()
         liveComms.toList().forEach { Comm_disconnect(it) }
+        publishedNames.keys.toList().forEach { runCatching { Unpublish_name(it) } }
         openPorts.keys.toList().forEach { Close_port(it) }
+        relayPorts.keys.toList().forEach { Close_port(it) }
         finalized = true
         initialized = false
     }
@@ -127,19 +139,35 @@ object MPI {
     fun Info_create() = Info()
 
     /**
-     * MPI_Open_port: abre um endereço de rede e devolve o port_name, no formato legível
-     * "ip:porta" (sem espaços, como recomenda o padrão, pois o usuário pode digitá-lo).
+     * MPI_Open_port: abre um endereço de rede e devolve o port_name.
+     *
+     * - padrão: porta TCP local, port_name "ip:porta" (sem espaços, como recomenda o
+     *   padrão, pois o usuário pode digitá-lo). Só é alcançável na mesma rede.
+     * - info "transport" = "relay": porta num broker MQTT público, port_name
+     *   "mqtts://broker:porta/ID". Alcançável de qualquer rede com internet.
      */
     fun Open_port(info: Info = INFO_NULL): String {
         checkInit()
+        if (info.get("transport") == "relay") {
+            val p = Relay.openPort()
+            relayPorts[p.portName] = p
+            return p.portName
+        }
         val host = info.get("host") ?: "0.0.0.0"
         val port = info.get("port")?.toIntOrNull() ?: DEFAULT_PORT
-        val server = ServerSocket()
-        server.reuseAddress = true
-        try {
-            server.bind(InetSocketAddress(port))
+        // Se o bind falha o ServerSocket é fechado, então a segunda tentativa usa outro.
+        fun bind(p: Int) = ServerSocket().apply {
+            reuseAddress = true
+            bind(InetSocketAddress(p))
+        }
+        val server = try {
+            bind(port)
         } catch (e: IOException) {
-            server.bind(InetSocketAddress(0)) // porta ocupada: o sistema escolhe outra
+            try {
+                bind(0) // porta ocupada: o sistema escolhe outra
+            } catch (e2: IOException) {
+                throw MpiException(ERR_PORT, "não foi possível abrir uma porta: ${e2.message}")
+            }
         }
         val portName = "$host:${server.localPort}"
         openPorts[portName] = server
@@ -149,6 +177,7 @@ object MPI {
     /** MPI_Close_port: libera o endereço. Um MPI_Comm_accept pendente falha com MPI_ERR_PORT. */
     fun Close_port(portName: String) {
         openPorts.remove(portName)?.close()
+        relayPorts.remove(portName)?.close()
     }
 
     /**
@@ -158,6 +187,19 @@ object MPI {
     fun Comm_accept(portName: String, info: Info = INFO_NULL, root: Int = 0, comm: Comm = COMM_SELF): Comm {
         checkInit()
         checkRoot(root, comm)
+        relayPorts[portName]?.let { relay ->
+            val stream = relay.accept()
+            return try {
+                stream.readTimeoutMs = 10_000
+                acceptHandshake(stream.input, stream.output, comm) { ctx, remote ->
+                    stream.readTimeoutMs = 0
+                    newInterComm(StreamChannel(stream.input, stream.output, stream::close), ctx, comm, remote)
+                }
+            } catch (e: IOException) {
+                stream.close()
+                throw MpiException(ERR_PORT, "falha no aperto de mão: ${e.message}")
+            }
+        }
         val server = openPorts[portName]
             ?: throw MpiException(ERR_PORT, "porta $portName não foi aberta com MPI_Open_port")
         val socket = try {
@@ -167,25 +209,49 @@ object MPI {
         }
         try {
             socket.tcpNoDelay = true
-            val inp = DataInputStream(socket.getInputStream())
-            val out = DataOutputStream(socket.getOutputStream())
-            if (inp.readInt() != Wire.MAGIC || inp.readInt() != Wire.VERSION || inp.readInt() != Wire.FRAME_HELLO) {
-                throw IOException("o cliente não fala este protocolo MPI")
+            val inp = socket.getInputStream()
+            val out = socket.getOutputStream()
+            return acceptHandshake(inp, out, comm) { ctx, remote ->
+                newInterComm(StreamChannel(inp, out, socket::close), ctx, comm, remote)
             }
-            val remoteSize = inp.readInt()
-            // O servidor escolhe o contexto do novo inter-comunicador (2+ ficam fora do WORLD/SELF).
-            val contextId = Random.nextInt(2, Int.MAX_VALUE)
-            out.writeInt(Wire.MAGIC)
-            out.writeInt(Wire.VERSION)
-            out.writeInt(Wire.FRAME_WELCOME)
-            out.writeInt(contextId)
-            out.writeInt(comm.size)
-            out.flush()
-            return newInterComm(socket, contextId, comm, remoteSize)
         } catch (e: IOException) {
             socket.close()
             throw MpiException(ERR_PORT, "falha no aperto de mão: ${e.message}")
         }
+    }
+
+    /** Aperto de mão do servidor: recebe HELLO e responde WELCOME com o contexto novo. */
+    private fun acceptHandshake(input: InputStream, output: OutputStream, comm: Comm, make: (Int, Int) -> Comm): Comm {
+        val inp = DataInputStream(input)
+        val out = DataOutputStream(output)
+        if (inp.readInt() != Wire.MAGIC || inp.readInt() != Wire.VERSION || inp.readInt() != Wire.FRAME_HELLO) {
+            throw IOException("o cliente não fala este protocolo MPI")
+        }
+        val remoteSize = inp.readInt()
+        // O servidor escolhe o contexto do novo inter-comunicador (2+ ficam fora do WORLD/SELF).
+        val contextId = Random.nextInt(2, Int.MAX_VALUE)
+        out.writeInt(Wire.MAGIC)
+        out.writeInt(Wire.VERSION)
+        out.writeInt(Wire.FRAME_WELCOME)
+        out.writeInt(contextId)
+        out.writeInt(comm.size)
+        out.flush()
+        return make(contextId, remoteSize)
+    }
+
+    /** Aperto de mão do cliente: envia HELLO e espera WELCOME. Devolve (contexto, tamanho remoto). */
+    private fun connectHandshake(input: InputStream, output: OutputStream, comm: Comm): Pair<Int, Int> {
+        val out = DataOutputStream(output)
+        val inp = DataInputStream(input)
+        out.writeInt(Wire.MAGIC)
+        out.writeInt(Wire.VERSION)
+        out.writeInt(Wire.FRAME_HELLO)
+        out.writeInt(comm.size)
+        out.flush()
+        if (inp.readInt() != Wire.MAGIC || inp.readInt() != Wire.VERSION || inp.readInt() != Wire.FRAME_WELCOME) {
+            throw IOException("o servidor não fala este protocolo MPI")
+        }
+        return inp.readInt() to inp.readInt()
     }
 
     /**
@@ -195,27 +261,33 @@ object MPI {
     fun Comm_connect(portName: String, info: Info = INFO_NULL, root: Int = 0, comm: Comm = COMM_SELF): Comm {
         checkInit()
         checkRoot(root, comm)
-        val (host, port) = parsePortName(portName)
         val timeout = info.get("timeout")?.toIntOrNull() ?: 10_000
+        if (Relay.isRelayPortName(portName.trim())) {
+            val stream = Relay.connect(portName.trim())
+            try {
+                stream.readTimeoutMs = timeout
+                val (contextId, remoteSize) = connectHandshake(stream.input, stream.output, comm)
+                stream.readTimeoutMs = 0
+                return newInterComm(StreamChannel(stream.input, stream.output, stream::close), contextId, comm, remoteSize)
+            } catch (e: SocketTimeoutException) {
+                stream.close()
+                throw MpiException(ERR_PORT, "ninguém respondeu em $portName (o outro celular está esperando?)")
+            } catch (e: IOException) {
+                stream.close()
+                throw MpiException(ERR_PORT, "não foi possível conectar a $portName: ${e.message}")
+            }
+        }
+        val (host, port) = parsePortName(portName)
         val socket = Socket()
         try {
             socket.connect(InetSocketAddress(host, port), timeout)
             socket.tcpNoDelay = true
             socket.soTimeout = timeout
-            val out = DataOutputStream(socket.getOutputStream())
-            val inp = DataInputStream(socket.getInputStream())
-            out.writeInt(Wire.MAGIC)
-            out.writeInt(Wire.VERSION)
-            out.writeInt(Wire.FRAME_HELLO)
-            out.writeInt(comm.size)
-            out.flush()
-            if (inp.readInt() != Wire.MAGIC || inp.readInt() != Wire.VERSION || inp.readInt() != Wire.FRAME_WELCOME) {
-                throw IOException("o servidor não fala este protocolo MPI")
-            }
-            val contextId = inp.readInt()
-            val remoteSize = inp.readInt()
+            val inp = socket.getInputStream()
+            val out = socket.getOutputStream()
+            val (contextId, remoteSize) = connectHandshake(inp, out, comm)
             socket.soTimeout = 0
-            return newInterComm(socket, contextId, comm, remoteSize)
+            return newInterComm(StreamChannel(inp, out, socket::close), contextId, comm, remoteSize)
         } catch (e: SocketTimeoutException) {
             socket.close()
             throw MpiException(ERR_PORT, "tempo esgotado conectando a $portName")
@@ -223,6 +295,36 @@ object MPI {
             socket.close()
             throw MpiException(ERR_PORT, "não foi possível conectar a $portName: ${e.message}")
         }
+    }
+
+    // ---- Serviço de nomes (Seção 11.9.4) --------------------------------------------
+
+    /**
+     * MPI_Publish_name: associa um nome de serviço (ex.: o código "K7Q2PX" que aparece na
+     * tela) a um port_name, para o cliente não precisar digitar o port_name inteiro.
+     * O nome fica guardado como mensagem retida num broker MQTT público.
+     */
+    fun Publish_name(serviceName: String, info: Info = INFO_NULL, portName: String) {
+        checkInit()
+        val preferred = relayPorts[portName]?.broker
+        Relay.publishName(serviceName, portName, preferred)
+        publishedNames[serviceName] = portName
+    }
+
+    /** MPI_Unpublish_name: remove a associação. Nome não publicado -> MPI_ERR_SERVICE. */
+    fun Unpublish_name(serviceName: String, info: Info = INFO_NULL, portName: String? = null) {
+        checkInit()
+        val p = publishedNames.remove(serviceName)
+            ?: throw MpiException(ERR_SERVICE, "nome \"$serviceName\" não foi publicado")
+        Relay.unpublishName(serviceName, portName ?: p)
+    }
+
+    /** MPI_Lookup_name: devolve o port_name publicado. Nome desconhecido -> MPI_ERR_NAME. */
+    fun Lookup_name(serviceName: String, info: Info = INFO_NULL): String {
+        checkInit()
+        val timeout = info.get("timeout")?.toLongOrNull() ?: 8_000
+        return Relay.lookupName(serviceName, timeout)
+            ?: throw MpiException(ERR_NAME, "nenhuma porta publicada com o nome \"$serviceName\"")
     }
 
     /** MPI_Comm_disconnect: espera as operações pendentes e desfaz a conexão. */
@@ -329,20 +431,22 @@ object MPI {
         ERR_TRUNCATE -> "MPI_ERR_TRUNCATE"
         ERR_INTERN -> "MPI_ERR_INTERN"
         ERR_INFO -> "MPI_ERR_INFO"
+        ERR_NAME -> "MPI_ERR_NAME"
         ERR_PORT -> "MPI_ERR_PORT"
+        ERR_SERVICE -> "MPI_ERR_SERVICE"
         else -> "MPI_ERR_OTHER"
     }
 
     // ---- Auxiliares ----------------------------------------------------------------
 
-    private fun newInterComm(socket: Socket, contextId: Int, local: Comm, remoteSize: Int): Comm {
+    private fun newInterComm(channel: StreamChannel, contextId: Int, local: Comm, remoteSize: Int): Comm {
         val c = Comm(
             name = "intercomm#$contextId",
             rank = local.rank,
             size = local.size,
             remoteSize = remoteSize,
             contextId = contextId,
-            channel = TcpChannel(socket),
+            channel = channel,
         )
         liveComms.add(c)
         return c

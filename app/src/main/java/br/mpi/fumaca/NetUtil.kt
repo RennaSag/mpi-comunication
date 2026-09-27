@@ -1,11 +1,9 @@
 package br.mpi.fumaca
 
-import android.content.Context
-import android.net.wifi.WifiManager
 import java.net.Inet4Address
 import java.net.NetworkInterface
 
-/** Descobre endereços IP úteis na rede do hotspot. */
+/** Descobre o IP deste celular na rede local (usado no port_name da conexão direta). */
 object NetUtil {
 
     /**
@@ -15,7 +13,7 @@ object NetUtil {
     fun localIp(): String? {
         val candidates = try {
             NetworkInterface.getNetworkInterfaces().toList()
-                .filter { it.isUp && !it.isLoopback }
+                .filter { it.isUp && !it.isLoopback && !isCellular(it.name) }
                 .flatMap { nif ->
                     nif.inetAddresses.toList()
                         .filterIsInstance<Inet4Address>()
@@ -27,18 +25,12 @@ object NetUtil {
         fun rank(name: String) = when {
             name.startsWith("ap") || name.startsWith("swlan") || name.startsWith("softap") -> 0
             name.startsWith("wlan") -> 1
-            name.startsWith("rmnet") || name.startsWith("ccmni") || name.startsWith("tun") -> 3
             else -> 2
         }
         return candidates.minByOrNull { rank(it.first) }?.second
     }
 
-    /** No celular cliente, o gateway do Wi-Fi é o celular que roteia o hotspot. */
-    @Suppress("DEPRECATION")
-    fun hotspotGateway(context: Context): String? {
-        val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return null
-        val g = wifi.dhcpInfo?.gateway ?: 0
-        if (g == 0) return null
-        return "${g and 0xFF}.${(g shr 8) and 0xFF}.${(g shr 16) and 0xFF}.${(g shr 24) and 0xFF}"
-    }
+    /** Dados móveis e VPN não alcançam o outro celular, então não servem de port_name. */
+    private fun isCellular(name: String) =
+        name.startsWith("rmnet") || name.startsWith("ccmni") || name.startsWith("tun") || name.startsWith("dummy")
 }

@@ -30,6 +30,9 @@ class SceneView(context: Context) : View(context) {
     private companion object {
         /** Intervalo entre as nuvens de um sinal, para que fiquem separadas no céu. */
         const val PUFF_INTERVAL = 1.5f
+        /** Velocidade (por segundo) com que a fogueira do pico acende e apaga. */
+        const val PEAK_FADE_IN = 2.5f
+        const val PEAK_FADE_OUT = 0.8f
     }
 
     var onFireTapped: (() -> Unit)? = null
@@ -56,7 +59,9 @@ class SceneView(context: Context) : View(context) {
     private val puffs = ArrayList<Puff>()
     private val sparks = ArrayList<Spark>()
     private var flareAt = -10f
-    private var signalUntil = -10f
+    /** Intensidade da fogueira do pico, de 0 (apagada) a 1 (acesa). */
+    private var peakGlow = 0f
+    private var lastFrame = 0f
 
     private val stars = List(45) { floatArrayOf(Random.nextFloat(), Random.nextFloat() * 0.38f, Random.nextFloat() * 6f) }
 
@@ -93,7 +98,6 @@ class SceneView(context: Context) : View(context) {
             intArrayOf(Color.argb(150, 255, 150, 60), Color.argb(0, 255, 120, 40)),
             null, Shader.TileMode.CLAMP,
         )
-        text.textSize = w * 0.042f
     }
 
     /** Recebeu uma mensagem MPI: sobe um sinal de [count] nuvens de fumaça. */
@@ -103,7 +107,6 @@ class SceneView(context: Context) : View(context) {
         for (i in 0 until count.coerceIn(1, 8)) {
             puffs += Puff(start + i * PUFF_INTERVAL, Random.nextFloat() * 10f)
         }
-        signalUntil = start + count * PUFF_INTERVAL + 1.5f
         showMessage("Sinal de fumaça recebido!", 5f)
     }
 
@@ -143,6 +146,8 @@ class SceneView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         val t = now
+        updatePeakGlow(t, (t - lastFrame).coerceIn(0f, 0.1f))
+        lastFrame = t
         drawSky(canvas, t)
         drawMountains(canvas, t)
         drawSmoke(canvas, t)
@@ -187,14 +192,7 @@ class SceneView(context: Context) : View(context) {
         polygon(c, 0.32f to 0.30f, 0.365f to 0.335f, 0.35f to 0.35f, 0.335f to 0.34f,
             0.315f to 0.36f, 0.295f to 0.345f, 0.27f to 0.355f)
 
-        // Pequena fogueira no pico, visível enquanto o sinal está subindo
-        if (t < signalUntil) {
-            val flick = 0.8f + 0.2f * sin(t * 25f)
-            fill.color = Color.argb((200 * flick).toInt(), 255, 150, 50)
-            c.drawCircle(peakX, peakY, w * 0.012f * flick, fill)
-            fill.color = Color.argb(60, 255, 150, 50)
-            c.drawCircle(peakX, peakY, w * 0.035f, fill)
-        }
+        if (peakGlow > 0.01f) drawPeakFire(c, t)
 
         // Colinas intermediárias
         fill.color = 0xFF2A3A4A.toInt()
@@ -206,6 +204,44 @@ class SceneView(context: Context) : View(context) {
         path.lineTo(0f, h)
         path.close()
         c.drawPath(path, fill)
+    }
+
+    /**
+     * A fogueira do pico fica acesa enquanto há nuvens saindo (de um pouco antes de cada
+     * nuvem até 2,5 s depois). Em vez de ligar e desligar, a intensidade segue esse alvo
+     * aos poucos: acende rápido e apaga devagar.
+     */
+    private fun updatePeakGlow(t: Float, dt: Float) {
+        val lit = puffs.any { t >= it.born - 0.4f && t - it.born < 2.5f }
+        peakGlow = if (lit) {
+            min(1f, peakGlow + dt * PEAK_FADE_IN)
+        } else {
+            max(0f, peakGlow - dt * PEAK_FADE_OUT)
+        }
+    }
+
+    /** Pequena fogueira no pico: halo, brasa e duas chamas, todos escalados por [peakGlow]. */
+    private fun drawPeakFire(c: Canvas, t: Float) {
+        val g = peakGlow * peakGlow * (3f - 2f * peakGlow) // suaviza início e fim (smoothstep)
+        val flick = 0.85f + 0.15f * sin(t * 21f) * sin(t * 7.3f + 1f)
+
+        // Halo que ilumina a neve do pico
+        fill.color = Color.argb((55 * g * flick).toInt(), 255, 150, 50)
+        c.drawCircle(peakX, peakY, w * 0.06f * (0.5f + 0.5f * g), fill)
+        fill.color = Color.argb((90 * g).toInt(), 255, 180, 80)
+        c.drawCircle(peakX, peakY, w * 0.028f * (0.5f + 0.5f * g), fill)
+
+        // Brasa e chamas, que crescem a partir da base ao acender
+        val base = peakY + w * 0.004f
+        fill.color = Color.argb((230 * g).toInt(), 120, 50, 20)
+        c.drawOval(RectF(peakX - w * 0.012f, base - w * 0.004f, peakX + w * 0.012f, base + w * 0.004f), fill)
+        for ((rgb, scale, phase) in listOf(Triple(0xFF7A1F, 1f, 0f), Triple(0xFFE066, 0.55f, 2.2f))) {
+            val fw = w * 0.011f * scale
+            val fh = w * 0.04f * scale * g * (0.85f + 0.15f * sin(t * 13f + phase))
+            val sway = sin(t * 7f + phase) * fw * 0.3f
+            fill.color = ((255 * g).toInt() shl 24) or rgb
+            flame(c, peakX, base, fw, fh, sway)
+        }
     }
 
     private fun drawSmoke(c: Canvas, t: Float) {
@@ -289,15 +325,19 @@ class SceneView(context: Context) : View(context) {
             val fw = w * 0.11f * scale * (0.9f + 0.1f * boost)
             val fh = w * 0.26f * scale * boost * (0.92f + 0.08f * sin(t * 11f + phase))
             val sway = sin(t * 6f + phase) * fw * 0.25f
-            val base = fireY - w * 0.005f
-            path.reset()
-            path.moveTo(fireX - fw, base)
-            path.cubicTo(fireX - fw * 1.1f, base - fh * 0.45f, fireX - fw * 0.2f + sway, base - fh * 0.7f, fireX + sway * 1.6f, base - fh)
-            path.cubicTo(fireX + fw * 0.25f + sway, base - fh * 0.65f, fireX + fw * 1.1f, base - fh * 0.45f, fireX + fw, base)
-            path.close()
             fill.color = color
-            c.drawPath(path, fill)
+            flame(c, fireX, fireY - w * 0.005f, fw, fh, sway)
         }
+    }
+
+    /** Uma chama em forma de gota: duas curvas de Bézier da base até a ponta. */
+    private fun flame(c: Canvas, x: Float, base: Float, fw: Float, fh: Float, sway: Float) {
+        path.reset()
+        path.moveTo(x - fw, base)
+        path.cubicTo(x - fw * 1.1f, base - fh * 0.45f, x - fw * 0.2f + sway, base - fh * 0.7f, x + sway * 1.6f, base - fh)
+        path.cubicTo(x + fw * 0.25f + sway, base - fh * 0.65f, x + fw * 1.1f, base - fh * 0.45f, x + fw, base)
+        path.close()
+        c.drawPath(path, fill)
     }
 
     private fun drawSparks(c: Canvas, t: Float) {
@@ -313,22 +353,28 @@ class SceneView(context: Context) : View(context) {
 
     private fun drawTexts(c: Canvas, t: Float) {
         text.typeface = Typeface.DEFAULT
-        text.textSize = w * 0.036f
         text.color = Color.argb(220, 255, 255, 255)
-        c.drawText(header, w / 2, h * 0.055f, text)
+        drawFitted(c, header, h * 0.055f, w * 0.036f)
 
         if (t < messageUntil) {
             val a = min(1f, (messageUntil - t) / 0.5f)
             text.typeface = Typeface.DEFAULT_BOLD
-            text.textSize = w * 0.055f
             text.color = Color.argb((255 * a).toInt(), 255, 236, 200)
-            c.drawText(message, w / 2, h * 0.12f, text)
+            drawFitted(c, message, h * 0.12f, w * 0.055f)
         }
 
         text.typeface = Typeface.DEFAULT
-        text.textSize = w * 0.038f
         text.color = Color.argb(200, 255, 230, 200)
-        c.drawText("Toque na fogueira para enviar um sinal", w / 2, h * 0.965f, text)
+        drawFitted(c, "Toque na fogueira para enviar um sinal", h * 0.965f, w * 0.038f)
+    }
+
+    /** Texto centralizado; diminui a fonte se ele não couber na largura da tela. */
+    private fun drawFitted(c: Canvas, s: String, y: Float, size: Float) {
+        text.textSize = size
+        val maxWidth = w * 0.92f
+        val width = text.measureText(s)
+        if (width > maxWidth) text.textSize = size * maxWidth / width
+        c.drawText(s, w / 2, y, text)
     }
 
     private fun polygon(c: Canvas, vararg pts: Pair<Float, Float>) =

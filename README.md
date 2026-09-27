@@ -8,12 +8,32 @@ A comunicação segue o padrão *MPI: A Message-Passing Interface Standard, vers
 ## Como usar
 
 1. Instale o `SinalDeFumaca.apk` (fica na pasta acima desta) nos dois celulares.
-2. **Celular A**: ligue o hotspot (roteador Wi-Fi) e abra o app → **Acender fogueira (servidor)**.
-   A tela mostra o `port_name`, por exemplo `192.168.43.1:50999`.
-3. **Celular B**: conecte ao hotspot do A, abra o app → **Conectar (cliente)**.
-   O campo já vem preenchido com o IP do hotspot; se não vier, digite o `port_name` do A.
+2. **Celular A** → **Acender fogueira (servidor)**. A tela mostra o `port_name` da rede
+   local (ex.: `192.168.43.1:50999`) e um **código** de 6 letras (ex.: `K7Q2PX`).
+3. **Celular B** → digite o código (funciona em qualquer rede, pela internet) ou o
+   `ip:porta` (mesma rede, mesmo sem internet) → **Conectar (cliente)**.
 4. Toque na fogueira de qualquer um dos celulares: a fumaça aparece no outro.
 5. Voltar (botão "voltar" do Android) desconecta os dois.
+
+### Redes diferentes (relay pela internet)
+
+Celulares em redes diferentes ficam atrás de NAT e não se alcançam por IP. Por isso a
+implementação MPI tem um segundo transporte (`mpi/Relay.kt`): os dois lados se conectam
+(TLS) a um broker MQTT público (`broker.hivemq.com`, com `test.mosquitto.org` de reserva)
+que repassa os bytes. O transporte é escolhido pelo `port_name`:
+
+| port_name                               | Transporte                 |
+|-----------------------------------------|----------------------------|
+| `192.168.43.1:50999`                    | TCP direto (mesma rede)    |
+| `mqtts://broker.hivemq.com:8883/<ID>`   | relay MQTT (qualquer rede) |
+
+O código de 6 letras usa o serviço de nomes do padrão (Seção 11.9.4):
+`MPI_Publish_name(código, port_name)` no servidor e `MPI_Lookup_name(código)` no cliente.
+O servidor faz `MPI_Comm_accept` nas duas portas ao mesmo tempo; a primeira conexão vence.
+
+Enquanto estão conectados, a fogueira faz barulho (`FireSound.kt`, com `res/raw/fogueira.mp3`):
+dois `MediaPlayer` se revezam com crossfade para o loop não ter corte, e o som pausa quando
+o app vai para segundo plano.
 
 ## Como o MPI é usado
 
@@ -25,8 +45,8 @@ modelo cliente/servidor da **Seção 11.9 (Establishing Communication)**, que de
 | Momento no app                  | Chamada MPI                                                   | Seção do padrão |
 |---------------------------------|---------------------------------------------------------------|-----------------|
 | App abre                        | `MPI_Init_thread(MPI_THREAD_MULTIPLE)`                        | 11.2, 11.6      |
-| Celular do hotspot              | `MPI_Open_port` → mostra o `port_name` → `MPI_Comm_accept`    | 11.9.1, 11.9.2  |
-| Celular conectado ao hotspot    | `MPI_Comm_connect(port_name)`                                 | 11.9.3          |
+| Celular servidor                | `MPI_Open_port` (local e relay) → `MPI_Publish_name` → `MPI_Comm_accept` | 11.9.1, 11.9.4, 11.9.2 |
+| Celular cliente                 | `MPI_Lookup_name(código)` → `MPI_Comm_connect(port_name)`     | 11.9.4, 11.9.3  |
 | Toque na fogueira               | `MPI_Send(buf={1 nuvem, nº}, 2, MPI_INT, dest=0, tag=1, intercomm)` | 3.2.1    |
 | Espera por sinais               | `MPI_Irecv(..., MPI_ANY_SOURCE, MPI_ANY_TAG, intercomm)` + `MPI_Wait` | 3.7.2, 3.7.3 |
 | Ler o sinal recebido            | `status.MPI_TAG`, `status.MPI_SOURCE`, `MPI_Get_count`        | 3.2.5           |
@@ -58,5 +78,5 @@ mesma API e a mesma semântica do padrão:
 
 ```
 gradlew assembleDebug        # gera app/build/outputs/apk/debug/app-debug.apk
-gradlew testDebugUnitTest    # testes da camada MPI (dois processos via localhost)
+gradlew testDebugUnitTest    # testes da camada MPI (localhost e relay pela internet)
 ```

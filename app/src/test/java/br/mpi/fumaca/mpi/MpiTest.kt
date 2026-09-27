@@ -84,6 +84,24 @@ class MpiTest {
     }
 
     @Test
+    fun portaOcupadaUsaOutra() {
+        java.net.ServerSocket(0).use { busy ->
+            val info = MPI.Info_create()
+            info.set("host", "127.0.0.1")
+            info.set("port", busy.localPort.toString())
+            val port = MPI.Open_port(info)
+            assertTrue(port != "127.0.0.1:${busy.localPort}")
+            var server: Comm? = null
+            val t = thread { server = MPI.Comm_accept(port) }
+            val client = MPI.Comm_connect(port)
+            t.join()
+            MPI.Close_port(port)
+            MPI.Comm_disconnect(client)
+            MPI.Comm_disconnect(server!!)
+        }
+    }
+
+    @Test
     fun erros() {
         val (a, b) = connectPair()
         assertEquals(MPI.ERR_TAG, runCatching { MPI.Send(IntArray(1), 1, MPI.INT, 0, -5, a) }

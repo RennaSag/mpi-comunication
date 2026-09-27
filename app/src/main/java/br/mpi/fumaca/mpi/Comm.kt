@@ -6,10 +6,12 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.EOFException
 import java.io.IOException
-import java.net.Socket
+import java.io.InputStream
+import java.io.OutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 
 /**
@@ -28,7 +30,7 @@ class Comm internal constructor(
     /** Tamanho do grupo remoto; 0 para intra-comunicadores. */
     internal val remoteSize: Int,
     internal val contextId: Int,
-    private val channel: TcpChannel?,
+    private val channel: StreamChannel?,
 ) {
     internal val isInter get() = channel != null
     internal val engine = MatchingEngine()
@@ -52,23 +54,30 @@ class Comm internal constructor(
     internal fun isend(msg: Message): Request {
         val req = Request(Request.Kind.SEND, this)
         if (freed) throw MpiException(MPI.ERR_COMM, "comunicador $name já foi desconectado")
-        sender.execute {
-            try {
-                if (channel != null) channel.write(msg) else engine.deliver(msg) // envio para si mesmo
-                req.status.MPI_SOURCE = rank
-                req.status.MPI_TAG = msg.tag
-                req.status.nbytes = msg.data.size
-            } catch (e: MpiException) {
-                req.error = e
-            } catch (e: IOException) {
-                req.error = MpiException(MPI.ERR_OTHER, "falha ao enviar: ${e.message}")
-            }
-            req.complete()
+        try {
+            sender.execute { send(msg, req) }
+        } catch (e: RejectedExecutionException) { // desconectado entre a verificação e o envio
+            throw MpiException(MPI.ERR_COMM, "comunicador $name já foi desconectado")
         }
         return req
     }
 
+    private fun send(msg: Message, req: Request) {
+        try {
+            if (channel != null) channel.write(msg) else engine.deliver(msg) // envio para si mesmo
+            req.status.MPI_SOURCE = rank
+            req.status.MPI_TAG = msg.tag
+            req.status.nbytes = msg.data.size
+        } catch (e: MpiException) {
+            req.error = e
+        } catch (e: IOException) {
+            req.error = MpiException(MPI.ERR_OTHER, "falha ao enviar: ${e.message}")
+        }
+        req.complete()
+    }
+
     /** MPI_Comm_disconnect: espera as comunicações pendentes e libera o comunicador. */
+    @Synchronized
     internal fun disconnect() {
         if (freed) return
         freed = true
@@ -224,17 +233,22 @@ internal class MatchingEngine {
 }
 
 /**
- * Canal TCP de um inter-comunicador. Cada mensagem vai com um cabeçalho de tamanho
- * fixo que codifica o envelope, como sugerido no "Advice to implementors" da
+ * Canal de um inter-comunicador sobre um fluxo de bytes: um socket TCP (mesma rede) ou
+ * uma sessão no relay da internet (Relay.kt). Cada mensagem vai com um cabeçalho de
+ * tamanho fixo que codifica o envelope, como sugerido no "Advice to implementors" da
  * Seção 3.2.3:
  *
  *   MAGIC | tipo de quadro | contexto | source | dest | tag | datatype | nbytes | dados...
  *
  * Uma thread de progresso (Seção 2.9) lê os quadros e entrega ao motor de casamento.
  */
-internal class TcpChannel(private val socket: Socket) {
-    private val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
-    private val inp = DataInputStream(BufferedInputStream(socket.getInputStream()))
+internal class StreamChannel(
+    input: InputStream,
+    output: OutputStream,
+    private val closeTransport: () -> Unit,
+) {
+    private val out = DataOutputStream(BufferedOutputStream(output))
+    private val inp = DataInputStream(BufferedInputStream(input))
     private lateinit var comm: Comm
 
     @Volatile private var closed = false
@@ -304,7 +318,7 @@ internal class TcpChannel(private val socket: Socket) {
             }
         }
         try {
-            socket.close()
+            closeTransport()
         } catch (_: IOException) {
         }
     }

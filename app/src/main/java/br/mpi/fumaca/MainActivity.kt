@@ -13,6 +13,8 @@ import android.os.Vibrator
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
@@ -24,13 +26,17 @@ import br.mpi.fumaca.mpi.MPI
 import br.mpi.fumaca.mpi.MpiException
 import br.mpi.fumaca.mpi.Request
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
+import kotlin.random.Random
 
 /**
  * Programa MPI de dois processos (um por celular):
  *
  *   MPI_Init_thread
- *   servidor: MPI_Open_port -> MPI_Comm_accept     cliente: MPI_Comm_connect
+ *   servidor: MPI_Open_port (rede local e internet) -> MPI_Publish_name(código) -> MPI_Comm_accept
+ *   cliente : MPI_Lookup_name(código) -> MPI_Comm_connect
  *   laço:  MPI_Irecv(ANY_SOURCE, ANY_TAG) + MPI_Wait  -> mostra o sinal de fumaça
  *   toque: MPI_Send(dest = 0 do grupo remoto, tag = TAG_FUMACA)
  *   saída: MPI_Send(TAG_ADEUS), MPI_Cancel, MPI_Comm_disconnect, MPI_Finalize
@@ -45,12 +51,20 @@ class MainActivity : Activity() {
         const val NUVENS_POR_SINAL = 1
         /** Rank do outro celular no grupo remoto do inter-comunicador. */
         const val OUTRO_CELULAR = 0
+        /** Letras do código da fogueira (sem 0/O, 1/I/L, que se confundem ao digitar). */
+        private const val CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
     }
 
     @Volatile private var comm: Comm? = null
-    @Volatile private var openPort: String? = null
+    /** Portas abertas pelo servidor enquanto espera: uma na rede local e outra no relay da internet. */
+    @Volatile private var openPorts: List<String> = emptyList()
+    /** Código publicado com MPI_Publish_name (o que o outro celular digita). */
+    @Volatile private var publishedName: String? = null
+    /** Diferencia "o usuário tocou em Cancelar" de uma falha real no MPI_Comm_accept. */
+    @Volatile private var waitCancelled = false
     @Volatile private var recvRequest: Request? = null
     private var scene: SceneView? = null
+    private var fireSound: FireSound? = null
     private var sequence = 0
 
     /** Chamadas MPI bloqueantes nunca rodam na thread de interface. */
@@ -73,6 +87,7 @@ class MainActivity : Activity() {
 
     private fun showSetup() {
         scene = null
+        stopFireSound()
         val dp = resources.displayMetrics.density
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -82,22 +97,27 @@ class MainActivity : Activity() {
         root.addView(label("Sinal de Fumaça", 30f, bold = true, color = 0xFFFFE0B2.toInt()))
         root.addView(label("Duas fogueiras, duas montanhas, uma conexão MPI.", 15f, color = 0xFFB0BEC5.toInt()), spaced(4, 24))
 
-        root.addView(label("1. No celular com o hotspot ligado", 17f, bold = true))
-        root.addView(label("Abre uma porta (MPI_Open_port) e espera o outro celular (MPI_Comm_accept).", 14f, color = 0xFFB0BEC5.toInt()), spaced(4, 8))
+        root.addView(label("1. Em um dos celulares", 17f, bold = true))
+        root.addView(label("Abre as portas (MPI_Open_port), publica um código (MPI_Publish_name) e espera o outro celular (MPI_Comm_accept).", 14f, color = 0xFFB0BEC5.toInt()), spaced(4, 8))
         serverButton = button("Acender fogueira (servidor)", 0xFFE8641C.toInt()) { startServer() }
         root.addView(serverButton, spaced(0, 28))
 
-        root.addView(label("2. No celular conectado ao hotspot", 17f, bold = true))
-        root.addView(label("Digite o port_name mostrado no outro celular (já preenchido com o IP do hotspot).", 14f, color = 0xFFB0BEC5.toInt()), spaced(4, 8))
+        root.addView(label("2. No outro celular", 17f, bold = true))
+        root.addView(label("Digite o código que aparece no primeiro celular (funciona em qualquer rede, pela internet) ou o ip:porta dele (mesma rede, sem internet).", 14f, color = 0xFFB0BEC5.toInt()), spaced(4, 8))
         portInput = EditText(this).apply {
-            setText(NetUtil.hotspotGateway(this@MainActivity)?.let { "$it:${MPI.DEFAULT_PORT}" } ?: "")
-            hint = "ip:porta, ex.: 192.168.43.1:${MPI.DEFAULT_PORT}"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            hint = "código (ex.: K7Q2PX) ou ip:porta"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             setTextColor(Color.WHITE)
             setHintTextColor(0xFF78909C.toInt())
             textSize = 17f
             typeface = Typeface.MONOSPACE
             isSingleLine = true
+            imeOptions = EditorInfo.IME_ACTION_GO
+            setOnEditorActionListener { _, action, _ ->
+                if (action == EditorInfo.IME_ACTION_GO) startClient()
+                action == EditorInfo.IME_ACTION_GO
+            }
         }
         root.addView(portInput, spaced(0, 8))
         clientButton = button("Conectar (cliente)", 0xFF37659A.toInt()) { startClient() }
@@ -120,58 +140,121 @@ class MainActivity : Activity() {
 
     private fun startServer() {
         setBusy(true)
-        val ip = NetUtil.localIp()
-        if (ip == null) {
-            setBusy(false)
-            statusView.text = "Nenhuma rede encontrada. Ligue o hotspot deste celular."
-            return
-        }
-        statusView.text = "Abrindo porta..."
-        thread(name = "mpi-accept") {
+        waitCancelled = false
+        statusView.text = "Abrindo portas...\n(MPI_Open_port)"
+        thread(name = "mpi-open") {
+            val ports = mutableListOf<String>()
+            val lines = StringBuilder()
+            // Porta 1: TCP direto, para quem está na mesma rede (hotspot ou mesmo Wi-Fi).
+            NetUtil.localIp()?.let { ip ->
+                try {
+                    val info = MPI.Info_create()
+                    info.set("host", ip)
+                    val port = MPI.Open_port(info)
+                    ports += port
+                    lines.append("Mesma rede (Wi-Fi / hotspot):\n    $port\n\n")
+                } catch (_: MpiException) {
+                }
+            }
+            // Porta 2: relay pela internet, para redes diferentes (4G, outro Wi-Fi...).
             try {
                 val info = MPI.Info_create()
-                info.set("host", ip)
+                info.set("transport", "relay")
                 val port = MPI.Open_port(info)
-                openPort = port
-                runOnUiThread {
-                    statusView.text = "port_name (MPI_Open_port):\n\n    $port\n\nAguardando o outro celular...\n(MPI_Comm_accept)"
-                    cancelButton.visibility = View.VISIBLE
+                ports += port
+                val code = String(CharArray(6) { CODE_ALPHABET[Random.nextInt(CODE_ALPHABET.length)] })
+                try {
+                    MPI.Publish_name(code, MPI.INFO_NULL, port)
+                    publishedName = code
+                    lines.append("Qualquer rede (internet), código:\n    $code\n\n")
+                } catch (e: MpiException) {
+                    lines.append("Qualquer rede (internet), port_name:\n    $port\n\n")
                 }
-                val c = MPI.Comm_accept(port, MPI.INFO_NULL, 0, MPI.COMM_SELF)
-                MPI.Close_port(port)
-                openPort = null
-                runOnUiThread { onConnected(c, "servidor") }
             } catch (e: MpiException) {
-                openPort?.let { MPI.Close_port(it) }
-                openPort = null
+                lines.append("Pela internet: indisponível (este celular está sem internet?)\n\n")
+            }
+            openPorts = ports
+            if (ports.isEmpty() || waitCancelled) {
+                closeServerPorts()
                 runOnUiThread {
                     setBusy(false)
-                    statusView.text = if (e.errorClass == MPI.ERR_PORT) "Espera cancelada." else "Erro: ${e.message}"
+                    statusView.text = if (waitCancelled) "Espera cancelada."
+                    else "Nenhuma rede encontrada. Ligue o Wi-Fi, o hotspot ou os dados móveis."
+                }
+                return@thread
+            }
+            runOnUiThread {
+                statusView.text = "${lines}Aguardando o outro celular...\n(MPI_Comm_accept)"
+                cancelButton.visibility = View.VISIBLE
+            }
+            // Um MPI_Comm_accept por porta; o primeiro cliente que chegar vence.
+            val won = AtomicBoolean(false)
+            val failures = AtomicInteger()
+            for (port in ports) {
+                thread(name = "mpi-accept") {
+                    try {
+                        val c = MPI.Comm_accept(port, MPI.INFO_NULL, 0, MPI.COMM_SELF)
+                        if (won.compareAndSet(false, true)) {
+                            runOnUiThread { onConnected(c, "servidor") }
+                            closeServerPorts() // o accept da outra porta falha com MPI_ERR_PORT
+                        } else {
+                            MPI.Comm_disconnect(c)
+                        }
+                    } catch (e: MpiException) {
+                        if (failures.incrementAndGet() == ports.size && !won.get()) {
+                            closeServerPorts()
+                            runOnUiThread {
+                                setBusy(false)
+                                statusView.text = if (waitCancelled) "Espera cancelada." else "Erro: ${e.message}"
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
+    /** MPI_Close_port nas portas de espera e MPI_Unpublish_name no código (acessa a rede). */
+    @Synchronized
+    private fun closeServerPorts() {
+        openPorts.forEach { MPI.Close_port(it) }
+        openPorts = emptyList()
+        publishedName?.let { runCatching { MPI.Unpublish_name(it) } }
+        publishedName = null
+    }
+
     private fun cancelWaiting() {
-        openPort?.let { MPI.Close_port(it) } // o MPI_Comm_accept pendente falha com MPI_ERR_PORT
+        waitCancelled = true
+        thread { closeServerPorts() } // os MPI_Comm_accept pendentes falham com MPI_ERR_PORT
     }
 
     private fun startClient() {
-        val portName = portInput.text.toString().trim()
-        if (portName.isEmpty()) {
-            statusView.text = "Informe o port_name (ip:porta) do outro celular."
+        val typed = portInput.text.toString().trim()
+        if (typed.isEmpty()) {
+            statusView.text = "Digite o código ou o ip:porta do outro celular."
             return
         }
+        if (!clientButton.isEnabled) return
+        hideKeyboard()
         setBusy(true)
-        statusView.text = "Conectando a $portName...\n(MPI_Comm_connect)"
+        // Sem ":" é um código (nome de serviço); com ":" já é um port_name (ip:porta ou mqtts://...).
+        val isCode = ':' !in typed
         thread(name = "mpi-connect") {
             try {
+                val portName = if (isCode) {
+                    val code = typed.uppercase().replace(" ", "").replace("-", "")
+                    runOnUiThread { statusView.text = "Procurando a fogueira $code...\n(MPI_Lookup_name)" }
+                    MPI.Lookup_name(code)
+                } else typed
+                runOnUiThread { statusView.text = "Conectando a $portName...\n(MPI_Comm_connect)" }
                 val c = MPI.Comm_connect(portName, MPI.INFO_NULL, 0, MPI.COMM_SELF)
                 runOnUiThread { onConnected(c, "cliente") }
             } catch (e: MpiException) {
+                val hint = if (isCode) "Confira o código e se os dois celulares têm internet."
+                else "Verifique se o outro celular já acendeu a fogueira e se os dois estão na mesma rede."
                 runOnUiThread {
                     setBusy(false)
-                    statusView.text = "Erro: ${e.message}\n\nVerifique se o outro celular já acendeu a fogueira e se este está no hotspot dele."
+                    statusView.text = "Erro: ${e.message}\n\n$hint"
                 }
             }
         }
@@ -188,6 +271,7 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------- Cena conectada
 
     private fun onConnected(c: Comm, role: String) {
+        hideKeyboard()
         comm = c
         val view = SceneView(this)
         view.header = "Você: $role · rank ${MPI.Comm_rank(c)} · grupo remoto: ${MPI.Comm_remote_size(c)} processo"
@@ -195,7 +279,13 @@ class MainActivity : Activity() {
         view.showMessage("Conectado! Toque na fogueira.", 4f)
         scene = view
         setContentView(view)
+        fireSound = FireSound(this).also { it.start() }
         startReceiver(c)
+    }
+
+    private fun stopFireSound() {
+        fireSound?.stop()
+        fireSound = null
     }
 
     /** Toque na fogueira: MPI_Send para o rank 0 do grupo remoto. */
@@ -207,7 +297,7 @@ class MainActivity : Activity() {
         mpiThread.execute {
             try {
                 MPI.Send(msg, msg.size, MPI.INT, OUTRO_CELULAR, TAG_FUMACA, c)
-                runOnUiThread { view.showMessage("Sinal enviado! (MPI_Send, tag $TAG_FUMACA)") }
+                runOnUiThread { view.showMessage("Sinal enviado (MPI_Send, tag $TAG_FUMACA)") }
             } catch (e: MpiException) {
                 runOnUiThread { view.showMessage("Falha ao enviar o sinal") }
             }
@@ -252,6 +342,7 @@ class MainActivity : Activity() {
     private fun peerGone(c: Comm, reason: String) {
         if (comm !== c) return
         comm = null
+        stopFireSound()
         mpiThread.execute { MPI.Comm_disconnect(c) }
         if (isFinishing) return
         AlertDialog.Builder(this)
@@ -285,8 +376,19 @@ class MainActivity : Activity() {
         showSetup()
     }
 
+    override fun onPause() {
+        super.onPause()
+        fireSound?.pause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        fireSound?.resume()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        stopFireSound()
         val c = comm
         comm = null
         // MPI_Finalize encerra o processo MPI; depois dele não se pode chamar MPI_Init de novo,
@@ -294,7 +396,7 @@ class MainActivity : Activity() {
         val cleanup = thread {
             try {
                 if (c != null) leave(c)
-                openPort?.let { MPI.Close_port(it) }
+                closeServerPorts()
                 MPI.Finalize()
             } catch (_: Exception) {
             }
@@ -304,6 +406,11 @@ class MainActivity : Activity() {
     }
 
     // ---------------------------------------------------------------- Auxiliares
+
+    private fun hideKeyboard() {
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager ?: return
+        imm.hideSoftInputFromWindow(window.decorView.windowToken, 0)
+    }
 
     private fun vibrate() {
         val v = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return

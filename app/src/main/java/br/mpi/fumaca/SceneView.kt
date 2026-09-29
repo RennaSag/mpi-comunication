@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RadialGradient
@@ -20,24 +21,23 @@ import kotlin.math.min
 import kotlin.math.sin
 import kotlin.random.Random
 
-/**
- * Cena: céu ao entardecer, uma montanha distante (onde está o outro celular) e a
- * fogueira do jogador em primeiro plano. Tocar na fogueira chama [onFireTapped];
- * [showSmokeSignal] faz subir um sinal de fumaça no topo da montanha distante.
- */
 class SceneView(context: Context) : View(context) {
-
     private companion object {
-        /** Intervalo entre as nuvens de um sinal, para que fiquem separadas no céu. */
         const val PUFF_INTERVAL = 1.5f
-        /** Velocidade (por segundo) com que a fogueira do pico acende e apaga. */
+
         const val PEAK_FADE_IN = 2.5f
         const val PEAK_FADE_OUT = 0.8f
+
+        val FIRE_FLAME_LAYERS = listOf(
+            Triple(0xFFE8411C.toInt(), 1.00f, 0f),
+            Triple(0xFFFF8A1F.toInt(), 0.72f, 1.7f),
+            Triple(0xFFFFE066.toInt(), 0.42f, 3.1f),
+        )
+        val PEAK_FLAME_LAYERS = listOf(Triple(0xFF7A1F, 1f, 0f), Triple(0xFFE066, 0.55f, 2.2f))
     }
 
     var onFireTapped: (() -> Unit)? = null
 
-    /** Linha de status no topo (quem sou eu / com quem estou conectado). */
     var header: String = ""
     private var message: String = ""
     private var messageUntil = 0f
@@ -48,7 +48,20 @@ class SceneView(context: Context) : View(context) {
         textAlign = Paint.Align.CENTER
         setShadowLayer(6f, 0f, 2f, Color.argb(160, 0, 0, 0))
     }
+
     private val path = Path()
+
+    private val rect = RectF()
+
+    private val cordilheiraPath = Path()
+    private val montanhaBasePath = Path()
+    private val montanhaFacePath = Path()
+    private val nevePath = Path()
+    private val colinasPath = Path()
+    private val foregroundPath = Path()
+    private val pinheirosPath = Path()
+    private val rocksPath = Path()
+    private val logsPath = Path()
 
     private val startNs = System.nanoTime()
     private val now get() = (System.nanoTime() - startNs) / 1e9f
@@ -59,7 +72,7 @@ class SceneView(context: Context) : View(context) {
     private val puffs = ArrayList<Puff>()
     private val sparks = ArrayList<Spark>()
     private var flareAt = -10f
-    /** Intensidade da fogueira do pico, de 0 (apagada) a 1 (acesa). */
+
     private var peakGlow = 0f
     private var lastFrame = 0f
 
@@ -68,7 +81,6 @@ class SceneView(context: Context) : View(context) {
     private var skyShader: Shader? = null
     private var glowShader: Shader? = null
 
-    // Geometria (recalculada em onSizeChanged)
     private var w = 1f
     private var h = 1f
     private var fireX = 0f
@@ -98,9 +110,71 @@ class SceneView(context: Context) : View(context) {
             intArrayOf(Color.argb(150, 255, 150, 60), Color.argb(0, 255, 120, 40)),
             null, Shader.TileMode.CLAMP,
         )
+        buildStaticPaths()
     }
 
-    /** Recebeu uma mensagem MPI: sobe um sinal de [count] nuvens de fumaça. */
+    private fun buildStaticPaths() {
+        buildPolygon(cordilheiraPath, -0.05f to 0.66f, 0.10f to 0.52f, 0.22f to 0.58f, 0.48f to 0.45f,
+            0.62f to 0.53f, 0.80f to 0.44f, 0.95f to 0.52f, 1.05f to 0.48f, 1.05f to 0.72f, -0.05f to 0.72f)
+        buildPolygon(montanhaBasePath, -0.15f to 0.72f, 0.12f to 0.44f, 0.20f to 0.39f, 0.32f to 0.30f,
+            0.44f to 0.40f, 0.56f to 0.46f, 0.82f to 0.72f)
+        buildPolygon(montanhaFacePath, 0.32f to 0.30f, 0.44f to 0.40f, 0.56f to 0.46f, 0.82f to 0.72f,
+            0.46f to 0.72f, 0.40f to 0.50f)
+        buildPolygon(nevePath, 0.32f to 0.30f, 0.365f to 0.335f, 0.35f to 0.35f, 0.335f to 0.34f,
+            0.315f to 0.36f, 0.295f to 0.345f, 0.27f to 0.355f)
+
+        colinasPath.reset()
+        colinasPath.moveTo(0f, h * 0.74f)
+        colinasPath.cubicTo(w * 0.25f, h * 0.66f, w * 0.55f, h * 0.73f, w * 0.75f, h * 0.68f)
+        colinasPath.cubicTo(w * 0.88f, h * 0.65f, w * 0.96f, h * 0.69f, w, h * 0.70f)
+        colinasPath.lineTo(w, h)
+        colinasPath.lineTo(0f, h)
+        colinasPath.close()
+
+        foregroundPath.reset()
+        foregroundPath.moveTo(0f, h * 0.80f)
+        foregroundPath.cubicTo(w * 0.30f, h * 0.76f, w * 0.70f, h * 0.76f, w, h * 0.81f)
+        foregroundPath.lineTo(w, h)
+        foregroundPath.lineTo(0f, h)
+        foregroundPath.close()
+
+        pinheirosPath.reset()
+        for ((px, s) in listOf(0.08f to 1.0f, 0.16f to 0.75f, 0.86f to 1.1f, 0.94f to 0.8f)) {
+            val base = h * 0.815f
+            val th = w * 0.20f * s
+            pinheirosPath.moveTo(px * w, base - th)
+            pinheirosPath.lineTo(px * w + th * 0.28f, base)
+            pinheirosPath.lineTo(px * w - th * 0.28f, base)
+            pinheirosPath.close()
+        }
+
+        rocksPath.reset()
+        for (i in 0 until 7) {
+            val a = PI.toFloat() * (i / 6f)
+            val x = fireX + kotlin.math.cos(a) * w * 0.14f
+            val y = fireY + w * 0.02f + sin(a) * w * 0.025f
+            rocksPath.addOval(RectF(x - w * 0.035f, y - w * 0.022f, x + w * 0.035f, y + w * 0.022f), Path.Direction.CW)
+        }
+
+        logsPath.reset()
+        for (angle in listOf(-18f, 18f)) {
+            val log = Path()
+            log.addRoundRect(
+                RectF(fireX - w * 0.13f, fireY - w * 0.02f, fireX + w * 0.13f, fireY + w * 0.02f),
+                w * 0.02f, w * 0.02f, Path.Direction.CW,
+            )
+            log.transform(Matrix().apply { setRotate(angle, fireX, fireY) })
+            logsPath.addPath(log)
+        }
+    }
+
+    private fun buildPolygon(target: Path, vararg pts: Pair<Float, Float>) {
+        target.reset()
+        target.moveTo(pts[0].first * w, pts[0].second * h)
+        for (i in 1 until pts.size) target.lineTo(pts[i].first * w, pts[i].second * h)
+        target.close()
+    }
+
     fun showSmokeSignal(count: Int) {
         val t = now
         val start = max(t, (puffs.maxOfOrNull { it.born } ?: t) + PUFF_INTERVAL)
@@ -110,7 +184,6 @@ class SceneView(context: Context) : View(context) {
         showMessage("Sinal de fumaça recebido!", 5f)
     }
 
-    /** Toque local: a fogueira aviva e solta faíscas. */
     fun flare() {
         val t = now
         flareAt = t
@@ -167,7 +240,7 @@ class SceneView(context: Context) : View(context) {
             fill.color = Color.argb(a, 255, 255, 240)
             c.drawCircle(s[0] * w, s[1] * h, w * 0.0035f + (s[2] % 1f) * w * 0.002f, fill)
         }
-        // Sol se pondo atrás das montanhas
+
         fill.color = Color.argb(70, 255, 210, 120)
         c.drawCircle(w * 0.70f, h * 0.49f, w * 0.13f, fill)
         fill.color = 0xFFFFD27A.toInt()
@@ -175,42 +248,24 @@ class SceneView(context: Context) : View(context) {
     }
 
     private fun drawMountains(c: Canvas, t: Float) {
-        // Cordilheira ao fundo
         fill.color = 0xFF6B5E8E.toInt()
-        polygon(c, -0.05f to 0.66f, 0.10f to 0.52f, 0.22f to 0.58f, 0.48f to 0.45f,
-            0.62f to 0.53f, 0.80f to 0.44f, 0.95f to 0.52f, 1.05f to 0.48f, 1.05f to 0.72f, -0.05f to 0.72f)
+        c.drawPath(cordilheiraPath, fill)
 
-        // Montanha principal: é onde está o outro celular
         fill.color = 0xFF3E3A66.toInt()
-        polygon(c, -0.15f to 0.72f, 0.12f to 0.44f, 0.20f to 0.39f, 0.32f to 0.30f,
-            0.44f to 0.40f, 0.56f to 0.46f, 0.82f to 0.72f)
-        // Face iluminada pelo sol
+        c.drawPath(montanhaBasePath, fill)
+
         fill.color = 0xFF534B7A.toInt()
-        polygon(c, 0.32f to 0.30f, 0.44f to 0.40f, 0.56f to 0.46f, 0.82f to 0.72f, 0.46f to 0.72f, 0.40f to 0.50f)
-        // Neve no pico
+        c.drawPath(montanhaFacePath, fill)
+
         fill.color = 0xFFEDEBF5.toInt()
-        polygon(c, 0.32f to 0.30f, 0.365f to 0.335f, 0.35f to 0.35f, 0.335f to 0.34f,
-            0.315f to 0.36f, 0.295f to 0.345f, 0.27f to 0.355f)
+        c.drawPath(nevePath, fill)
 
         if (peakGlow > 0.01f) drawPeakFire(c, t)
 
-        // Colinas intermediárias
         fill.color = 0xFF2A3A4A.toInt()
-        path.reset()
-        path.moveTo(0f, h * 0.74f)
-        path.cubicTo(w * 0.25f, h * 0.66f, w * 0.55f, h * 0.73f, w * 0.75f, h * 0.68f)
-        path.cubicTo(w * 0.88f, h * 0.65f, w * 0.96f, h * 0.69f, w, h * 0.70f)
-        path.lineTo(w, h)
-        path.lineTo(0f, h)
-        path.close()
-        c.drawPath(path, fill)
+        c.drawPath(colinasPath, fill)
     }
 
-    /**
-     * A fogueira do pico fica acesa enquanto há nuvens saindo (de um pouco antes de cada
-     * nuvem até 2,5 s depois). Em vez de ligar e desligar, a intensidade segue esse alvo
-     * aos poucos: acende rápido e apaga devagar.
-     */
     private fun updatePeakGlow(t: Float, dt: Float) {
         val lit = puffs.any { t >= it.born - 0.4f && t - it.born < 2.5f }
         peakGlow = if (lit) {
@@ -220,22 +275,20 @@ class SceneView(context: Context) : View(context) {
         }
     }
 
-    /** Pequena fogueira no pico: halo, brasa e duas chamas, todos escalados por [peakGlow]. */
     private fun drawPeakFire(c: Canvas, t: Float) {
-        val g = peakGlow * peakGlow * (3f - 2f * peakGlow) // suaviza início e fim (smoothstep)
+        val g = peakGlow * peakGlow * (3f - 2f * peakGlow)
         val flick = 0.85f + 0.15f * sin(t * 21f) * sin(t * 7.3f + 1f)
 
-        // Halo que ilumina a neve do pico
         fill.color = Color.argb((55 * g * flick).toInt(), 255, 150, 50)
         c.drawCircle(peakX, peakY, w * 0.06f * (0.5f + 0.5f * g), fill)
         fill.color = Color.argb((90 * g).toInt(), 255, 180, 80)
         c.drawCircle(peakX, peakY, w * 0.028f * (0.5f + 0.5f * g), fill)
 
-        // Brasa e chamas, que crescem a partir da base ao acender
         val base = peakY + w * 0.004f
         fill.color = Color.argb((230 * g).toInt(), 120, 50, 20)
-        c.drawOval(RectF(peakX - w * 0.012f, base - w * 0.004f, peakX + w * 0.012f, base + w * 0.004f), fill)
-        for ((rgb, scale, phase) in listOf(Triple(0xFF7A1F, 1f, 0f), Triple(0xFFE066, 0.55f, 2.2f))) {
+        rect.set(peakX - w * 0.012f, base - w * 0.004f, peakX + w * 0.012f, base + w * 0.004f)
+        c.drawOval(rect, fill)
+        for ((rgb, scale, phase) in PEAK_FLAME_LAYERS) {
             val fw = w * 0.011f * scale
             val fh = w * 0.04f * scale * g * (0.85f + 0.15f * sin(t * 13f + phase))
             val sway = sin(t * 7f + phase) * fw * 0.3f
@@ -256,7 +309,7 @@ class SceneView(context: Context) : View(context) {
             val y = peakY - w * 0.03f - rise
             val r = w * (0.03f + 0.03f * min(1f, age / 3f))
             val alpha = (min(1f, age / 0.4f) * (1f - k * k) * 235).toInt().coerceIn(0, 255)
-            // Cada sinal é uma "bola" de fumaça formada por vários círculos
+
             fill.color = Color.argb(alpha / 3, 120, 110, 120)
             c.drawCircle(x + r * 0.15f, y + r * 0.2f, r * 1.05f, fill)
             fill.color = Color.argb(alpha, 232, 228, 222)
@@ -271,57 +324,26 @@ class SceneView(context: Context) : View(context) {
 
     private fun drawForeground(c: Canvas) {
         fill.color = 0xFF1B2A22.toInt()
-        path.reset()
-        path.moveTo(0f, h * 0.80f)
-        path.cubicTo(w * 0.30f, h * 0.76f, w * 0.70f, h * 0.76f, w, h * 0.81f)
-        path.lineTo(w, h)
-        path.lineTo(0f, h)
-        path.close()
-        c.drawPath(path, fill)
+        c.drawPath(foregroundPath, fill)
 
-        // Pinheiros
         fill.color = 0xFF10201A.toInt()
-        for ((px, s) in listOf(0.08f to 1.0f, 0.16f to 0.75f, 0.86f to 1.1f, 0.94f to 0.8f)) {
-            val base = h * 0.815f
-            val th = w * 0.20f * s
-            polygonAbs(c, px * w to base - th, px * w + th * 0.28f to base, px * w - th * 0.28f to base)
-        }
+        c.drawPath(pinheirosPath, fill)
     }
 
     private fun drawFire(c: Canvas, t: Float) {
         val boost = 1f + 0.6f * max(0f, 1f - (t - flareAt) / 1.2f)
 
         fill.shader = glowShader
-        c.save()
-        c.scale(boost, boost, fireX, fireY)
         c.drawCircle(fireX, fireY - w * 0.06f, w * 0.45f, fill)
-        c.restore()
         fill.shader = null
 
-        // Pedras
         fill.color = 0xFF5E5A57.toInt()
-        for (i in 0 until 7) {
-            val a = PI.toFloat() * (i / 6f)
-            val x = fireX + kotlin.math.cos(a) * w * 0.14f
-            val y = fireY + w * 0.02f + sin(a) * w * 0.025f
-            c.drawOval(RectF(x - w * 0.035f, y - w * 0.022f, x + w * 0.035f, y + w * 0.022f), fill)
-        }
-        // Lenha
-        fill.color = 0xFF6B3E1E.toInt()
-        for (angle in listOf(-18f, 18f)) {
-            c.save()
-            c.rotate(angle, fireX, fireY)
-            c.drawRoundRect(RectF(fireX - w * 0.13f, fireY - w * 0.02f, fireX + w * 0.13f, fireY + w * 0.02f), w * 0.02f, w * 0.02f, fill)
-            c.restore()
-        }
+        c.drawPath(rocksPath, fill)
 
-        // Chamas: três camadas que tremulam
-        val layers = listOf(
-            Triple(0xFFE8411C.toInt(), 1.00f, 0f),
-            Triple(0xFFFF8A1F.toInt(), 0.72f, 1.7f),
-            Triple(0xFFFFE066.toInt(), 0.42f, 3.1f),
-        )
-        for ((color, scale, phase) in layers) {
+        fill.color = 0xFF6B3E1E.toInt()
+        c.drawPath(logsPath, fill)
+
+        for ((color, scale, phase) in FIRE_FLAME_LAYERS) {
             val fw = w * 0.11f * scale * (0.9f + 0.1f * boost)
             val fh = w * 0.26f * scale * boost * (0.92f + 0.08f * sin(t * 11f + phase))
             val sway = sin(t * 6f + phase) * fw * 0.25f
@@ -330,7 +352,6 @@ class SceneView(context: Context) : View(context) {
         }
     }
 
-    /** Uma chama em forma de gota: duas curvas de Bézier da base até a ponta. */
     private fun flame(c: Canvas, x: Float, base: Float, fw: Float, fh: Float, sway: Float) {
         path.reset()
         path.moveTo(x - fw, base)
@@ -368,23 +389,11 @@ class SceneView(context: Context) : View(context) {
         drawFitted(c, "Toque na fogueira para enviar um sinal", h * 0.965f, w * 0.038f)
     }
 
-    /** Texto centralizado; diminui a fonte se ele não couber na largura da tela. */
     private fun drawFitted(c: Canvas, s: String, y: Float, size: Float) {
         text.textSize = size
         val maxWidth = w * 0.92f
         val width = text.measureText(s)
         if (width > maxWidth) text.textSize = size * maxWidth / width
         c.drawText(s, w / 2, y, text)
-    }
-
-    private fun polygon(c: Canvas, vararg pts: Pair<Float, Float>) =
-        polygonAbs(c, *pts.map { it.first * w to it.second * h }.toTypedArray())
-
-    private fun polygonAbs(c: Canvas, vararg pts: Pair<Float, Float>) {
-        path.reset()
-        path.moveTo(pts[0].first, pts[0].second)
-        for (i in 1 until pts.size) path.lineTo(pts[i].first, pts[i].second)
-        path.close()
-        c.drawPath(path, fill)
     }
 }

@@ -14,35 +14,13 @@ import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.random.Random
 
-/**
- * Implementação mínima do padrão MPI (MPI: A Message-Passing Interface Standard,
- * versão 5.0) em Kotlin puro, sobre TCP, para rodar em celulares Android.
- *
- * Os nomes e a semântica seguem as bindings em C do padrão:
- *   MPI_Send(buf, count, datatype, dest, tag, comm)  ->  MPI.Send(buf, count, datatype, dest, tag, comm)
- *
- * Cada celular é um processo MPI "singleton" (Seção 11.10.2: inicialização singleton, sem mpiexec), com
- * MPI_COMM_WORLD de tamanho 1. Os dois processos foram iniciados de forma independente,
- * por isso a comunicação é estabelecida pelo modelo cliente/servidor da Seção 11.9:
- *
- *   servidor: MPI_Open_port -> MPI_Publish_name -> MPI_Comm_accept
- *   cliente : MPI_Lookup_name -> MPI_Comm_connect(port_name)
- *
- * Há dois transportes, escolhidos pelo port_name:
- *   "ip:porta"                   TCP direto (os dois na mesma rede / hotspot)
- *   "mqtts://broker:porta/ID"    relay pela internet (redes diferentes, atrás de NAT; Relay.kt)
- *
- * O resultado é um inter-comunicador em que cada lado tem rank 0 e o grupo remoto
- * tem tamanho 1; depois disso toda a troca usa comunicação ponto-a-ponto (Capítulo 3).
- */
 object MPI {
-    // ---- Constantes (Apêndice A) --------------------------------------------------
     const val SUCCESS = 0
     const val ANY_SOURCE = -1
     const val ANY_TAG = -1
     const val PROC_NULL = -2
     const val UNDEFINED = -32766
-    /** Maior tag válida; o padrão exige pelo menos 32767 (Seção 3.2.3). */
+
     const val TAG_UB = 32767
     const val MAX_PORT_NAME = 256
 
@@ -51,7 +29,6 @@ object MPI {
     const val THREAD_SERIALIZED = 2
     const val THREAD_MULTIPLE = 3
 
-    // Classes de erro (Seção 9.4). Os valores são definidos pela implementação.
     const val ERR_BUFFER = 1
     const val ERR_COUNT = 2
     const val ERR_TYPE = 3
@@ -69,17 +46,14 @@ object MPI {
     const val ERR_PORT = 38
     const val ERR_SERVICE = 41
 
-    // Tipos de dados predefinidos (Tabela 3.2).
     val INT = Datatype(1, "MPI_INT", 4)
     val CHAR = Datatype(2, "MPI_CHAR", 1)
     val BYTE = Datatype(3, "MPI_BYTE", 1)
 
     val INFO_NULL = Info(readOnly = true)
 
-    /** Porta padrão usada por Open_port quando o Info não indica outra. */
     const val DEFAULT_PORT = 50999
 
-    // ---- Estado do processo --------------------------------------------------------
     @Volatile private var initialized = false
     @Volatile private var finalized = false
     private val openPorts = ConcurrentHashMap<String, ServerSocket>()
@@ -92,13 +66,10 @@ object MPI {
     lateinit var COMM_SELF: Comm
         private set
 
-    // ---- Inicialização e finalização (Seção 11.2) ------------------------------------
-
     fun Init() {
         Init_thread(THREAD_SINGLE)
     }
 
-    /** Retorna o nível de thread fornecido; esta implementação é thread-safe (MULTIPLE). */
     @Synchronized
     fun Init_thread(required: Int): Int {
         if (initialized) throw MpiException(ERR_OTHER, "MPI_Init chamado duas vezes")
@@ -112,7 +83,6 @@ object MPI {
     fun Initialized() = initialized
     fun Finalized() = finalized
 
-    /** Libera conexões e portas. Depois disso nenhuma outra chamada MPI é permitida. */
     @Synchronized
     fun Finalize() {
         checkInit()
@@ -124,8 +94,6 @@ object MPI {
         initialized = false
     }
 
-    // ---- Comunicadores ---------------------------------------------------------------
-
     fun Comm_rank(comm: Comm): Int = comm.rank
     fun Comm_size(comm: Comm): Int = comm.size
     fun Comm_remote_size(comm: Comm): Int {
@@ -134,18 +102,8 @@ object MPI {
     }
     fun Comm_test_inter(comm: Comm): Boolean = comm.isInter
 
-    // ---- Estabelecendo comunicação (Seção 11.9) ------------------------------------
-
     fun Info_create() = Info()
 
-    /**
-     * MPI_Open_port: abre um endereço de rede e devolve o port_name.
-     *
-     * - padrão: porta TCP local, port_name "ip:porta" (sem espaços, como recomenda o
-     *   padrão, pois o usuário pode digitá-lo). Só é alcançável na mesma rede.
-     * - info "transport" = "relay": porta num broker MQTT público, port_name
-     *   "mqtts://broker:porta/ID". Alcançável de qualquer rede com internet.
-     */
     fun Open_port(info: Info = INFO_NULL): String {
         checkInit()
         if (info.get("transport") == "relay") {
@@ -155,7 +113,7 @@ object MPI {
         }
         val host = info.get("host") ?: "0.0.0.0"
         val port = info.get("port")?.toIntOrNull() ?: DEFAULT_PORT
-        // Se o bind falha o ServerSocket é fechado, então a segunda tentativa usa outro.
+
         fun bind(p: Int) = ServerSocket().apply {
             reuseAddress = true
             bind(InetSocketAddress(p))
@@ -164,7 +122,7 @@ object MPI {
             bind(port)
         } catch (e: IOException) {
             try {
-                bind(0) // porta ocupada: o sistema escolhe outra
+                bind(0)
             } catch (e2: IOException) {
                 throw MpiException(ERR_PORT, "não foi possível abrir uma porta: ${e2.message}")
             }
@@ -174,16 +132,11 @@ object MPI {
         return portName
     }
 
-    /** MPI_Close_port: libera o endereço. Um MPI_Comm_accept pendente falha com MPI_ERR_PORT. */
     fun Close_port(portName: String) {
         openPorts.remove(portName)?.close()
         relayPorts.remove(portName)?.close()
     }
 
-    /**
-     * MPI_Comm_accept: bloqueia até um cliente se conectar e devolve um
-     * inter-comunicador cujo grupo remoto é o cliente.
-     */
     fun Comm_accept(portName: String, info: Info = INFO_NULL, root: Int = 0, comm: Comm = COMM_SELF): Comm {
         checkInit()
         checkRoot(root, comm)
@@ -220,7 +173,6 @@ object MPI {
         }
     }
 
-    /** Aperto de mão do servidor: recebe HELLO e responde WELCOME com o contexto novo. */
     private fun acceptHandshake(input: InputStream, output: OutputStream, comm: Comm, make: (Int, Int) -> Comm): Comm {
         val inp = DataInputStream(input)
         val out = DataOutputStream(output)
@@ -228,7 +180,7 @@ object MPI {
             throw IOException("o cliente não fala este protocolo MPI")
         }
         val remoteSize = inp.readInt()
-        // O servidor escolhe o contexto do novo inter-comunicador (2+ ficam fora do WORLD/SELF).
+
         val contextId = Random.nextInt(2, Int.MAX_VALUE)
         out.writeInt(Wire.MAGIC)
         out.writeInt(Wire.VERSION)
@@ -239,7 +191,6 @@ object MPI {
         return make(contextId, remoteSize)
     }
 
-    /** Aperto de mão do cliente: envia HELLO e espera WELCOME. Devolve (contexto, tamanho remoto). */
     private fun connectHandshake(input: InputStream, output: OutputStream, comm: Comm): Pair<Int, Int> {
         val out = DataOutputStream(output)
         val inp = DataInputStream(input)
@@ -254,10 +205,6 @@ object MPI {
         return inp.readInt() to inp.readInt()
     }
 
-    /**
-     * MPI_Comm_connect: conecta ao servidor identificado por port_name. Se a porta não
-     * existe, ou não há MPI_Comm_accept dentro do tempo limite, gera MPI_ERR_PORT.
-     */
     fun Comm_connect(portName: String, info: Info = INFO_NULL, root: Int = 0, comm: Comm = COMM_SELF): Comm {
         checkInit()
         checkRoot(root, comm)
@@ -297,13 +244,6 @@ object MPI {
         }
     }
 
-    // ---- Serviço de nomes (Seção 11.9.4) --------------------------------------------
-
-    /**
-     * MPI_Publish_name: associa um nome de serviço (ex.: o código "K7Q2PX" que aparece na
-     * tela) a um port_name, para o cliente não precisar digitar o port_name inteiro.
-     * O nome fica guardado como mensagem retida num broker MQTT público.
-     */
     fun Publish_name(serviceName: String, info: Info = INFO_NULL, portName: String) {
         checkInit()
         val preferred = relayPorts[portName]?.broker
@@ -311,7 +251,6 @@ object MPI {
         publishedNames[serviceName] = portName
     }
 
-    /** MPI_Unpublish_name: remove a associação. Nome não publicado -> MPI_ERR_SERVICE. */
     fun Unpublish_name(serviceName: String, info: Info = INFO_NULL, portName: String? = null) {
         checkInit()
         val p = publishedNames.remove(serviceName)
@@ -319,7 +258,6 @@ object MPI {
         Relay.unpublishName(serviceName, portName ?: p)
     }
 
-    /** MPI_Lookup_name: devolve o port_name publicado. Nome desconhecido -> MPI_ERR_NAME. */
     fun Lookup_name(serviceName: String, info: Info = INFO_NULL): String {
         checkInit()
         val timeout = info.get("timeout")?.toLongOrNull() ?: 8_000
@@ -327,25 +265,19 @@ object MPI {
             ?: throw MpiException(ERR_NAME, "nenhuma porta publicada com o nome \"$serviceName\"")
     }
 
-    /** MPI_Comm_disconnect: espera as operações pendentes e desfaz a conexão. */
     fun Comm_disconnect(comm: Comm) {
         if (!comm.isInter) throw MpiException(ERR_COMM, "só inter-comunicadores podem ser desconectados aqui")
         comm.disconnect()
         liveComms.remove(comm)
     }
 
-    // ---- Comunicação ponto-a-ponto (Capítulo 3) --------------------------------------
-
-    /** MPI_Send bloqueante (Seção 3.2.1): retorna quando o buffer pode ser reutilizado. */
     fun Send(buf: Any, count: Int, datatype: Datatype, dest: Int, tag: Int, comm: Comm) {
         Wait(Isend(buf, count, datatype, dest, tag, comm))
     }
 
-    /** MPI_Recv bloqueante (Seção 3.2.4). */
     fun Recv(buf: Any, count: Int, datatype: Datatype, source: Int, tag: Int, comm: Comm): Status =
         Wait(Irecv(buf, count, datatype, source, tag, comm))
 
-    /** MPI_Isend (Seção 3.7.2): inicia o envio e devolve uma requisição. */
     fun Isend(buf: Any, count: Int, datatype: Datatype, dest: Int, tag: Int, comm: Comm): Request {
         checkInit()
         if (tag < 0 || tag > TAG_UB) throw MpiException(ERR_TAG, "tag inválida: $tag")
@@ -355,18 +287,16 @@ object MPI {
             complete()
         }
         if (dest < 0 || dest >= comm.targetSize) throw MpiException(ERR_RANK, "rank de destino inválido: $dest")
-        // O source do envelope é implícito: o rank de quem envia (Seção 3.2.3).
+
         val msg = Message(comm.contextId, comm.rank, dest, tag, datatype.id, datatype.pack(buf, count))
         return comm.isend(msg)
     }
 
-    /** MPI_Irecv (Seção 3.7.2): posta um receive que casa pelo envelope (source, tag, comm). */
     fun Irecv(buf: Any, count: Int, datatype: Datatype, source: Int, tag: Int, comm: Comm): Request {
         checkInit()
         if (tag != ANY_TAG && (tag < 0 || tag > TAG_UB)) throw MpiException(ERR_TAG, "tag inválida: $tag")
         val req = Request(Request.Kind.RECV, comm)
         if (source == PROC_NULL) {
-            // Seção 3.10: receive de MPI_PROC_NULL completa imediatamente, sem dados.
             req.status.MPI_SOURCE = PROC_NULL
             req.status.MPI_TAG = ANY_TAG
             req.complete()
@@ -384,36 +314,30 @@ object MPI {
         return req
     }
 
-    /** MPI_Wait (Seção 3.7.3): bloqueia até a operação terminar. */
     fun Wait(request: Request): Status {
         request.await()
         request.error?.let { throw it }
         return request.status
     }
 
-    /** MPI_Test (Seção 3.7.3): devolve o Status se terminou (flag = true) ou null. */
     fun Test(request: Request): Status? {
         if (!request.isComplete) return null
         request.error?.let { throw it }
         return request.status
     }
 
-    /** MPI_Cancel (Seção 3.8.4): cancela um receive ainda não casado. */
     fun Cancel(request: Request) {
         if (request.kind == Request.Kind.RECV) request.comm.engine.cancel(request)
     }
 
     fun Test_cancelled(status: Status): Boolean = status.cancelled
 
-    /** MPI_Probe (Seção 3.8.1): bloqueia até existir uma mensagem que case, sem recebê-la. */
     fun Probe(source: Int, tag: Int, comm: Comm): Status =
         comm.engine.probe(comm.contextId, source, tag, blocking = true)!!
 
-    /** MPI_Iprobe: versão não-bloqueante; null se não há mensagem (flag = false). */
     fun Iprobe(source: Int, tag: Int, comm: Comm): Status? =
         comm.engine.probe(comm.contextId, source, tag, blocking = false)
 
-    /** MPI_Get_count (Seção 3.2.5): número de elementos recebidos. */
     fun Get_count(status: Status, datatype: Datatype): Int =
         if (status.nbytes % datatype.extent != 0) UNDEFINED else status.nbytes / datatype.extent
 
@@ -437,8 +361,6 @@ object MPI {
         else -> "MPI_ERR_OTHER"
     }
 
-    // ---- Auxiliares ----------------------------------------------------------------
-
     private fun newInterComm(channel: StreamChannel, contextId: Int, local: Comm, remoteSize: Int): Comm {
         val c = Comm(
             name = "intercomm#$contextId",
@@ -452,7 +374,6 @@ object MPI {
         return c
     }
 
-    /** Aceita "ip:porta", "host:porta" ou "tcp://ip:porta" (formas equivalentes, Seção 11.9.3). */
     private fun parsePortName(portName: String): Pair<String, Int> {
         val s = portName.trim().removePrefix("tcp://")
         val i = s.lastIndexOf(':')

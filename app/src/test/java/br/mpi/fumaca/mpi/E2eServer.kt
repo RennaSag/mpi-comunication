@@ -3,7 +3,6 @@ package br.mpi.fumaca.mpi
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 
-/** Faz o papel do celular "servidor" para testar o app como cliente (só roda com MPI_E2E_SERVER=1, ou =relay para esperar pela internet). */
 class E2eServer {
     @Test
     fun aceitaOApp() {

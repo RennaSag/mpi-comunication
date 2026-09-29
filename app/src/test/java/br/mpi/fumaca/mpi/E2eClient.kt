@@ -3,14 +3,13 @@ package br.mpi.fumaca.mpi
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 
-/** Faz o papel do "segundo celular" contra o app rodando no emulador (só roda com MPI_E2E=ip:porta ou MPI_E2E=código). */
 class E2eClient {
     @Test
     fun conversaComOApp() {
         val port = System.getenv("MPI_E2E")
         assumeTrue(port != null)
         if (!MPI.Initialized()) MPI.Init()
-        // Sem ":" é o código mostrado no app: acha o port_name pelo serviço de nomes.
+
         val portName = if (':' in port!!) port else MPI.Lookup_name(port)
         println("E2E: port_name = $portName")
         val c = MPI.Comm_connect(portName)

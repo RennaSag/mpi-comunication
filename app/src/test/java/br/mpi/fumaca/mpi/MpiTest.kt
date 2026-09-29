@@ -8,7 +8,6 @@ import org.junit.BeforeClass
 import org.junit.Test
 import kotlin.concurrent.thread
 
-/** Simula os dois celulares no mesmo computador, conectados via localhost. */
 class MpiTest {
     companion object {
         @JvmStatic
@@ -59,7 +58,7 @@ class MpiTest {
         for (i in 1..50) MPI.Send(intArrayOf(i), 1, MPI.INT, 0, if (i % 2 == 0) 2 else 1, a)
         MPI.Probe(0, 2, b)
         val buf = IntArray(1)
-        // Mensagens de mesma tag chegam na ordem enviada (não-ultrapassagem)
+
         for (i in 2..50 step 2) { MPI.Recv(buf, 1, MPI.INT, 0, 2, b); assertEquals(i, buf[0]) }
         for (i in 1..49 step 2) { MPI.Recv(buf, 1, MPI.INT, 0, 1, b); assertEquals(i, buf[0]) }
         assertNull(MPI.Iprobe(MPI.ANY_SOURCE, MPI.ANY_TAG, b))
@@ -75,7 +74,6 @@ class MpiTest {
         MPI.Cancel(req)
         assertTrue(MPI.Test_cancelled(MPI.Wait(req)))
 
-        // Um receive pendente falha quando o outro lado desconecta
         val pending = MPI.Irecv(IntArray(2), 2, MPI.INT, MPI.ANY_SOURCE, MPI.ANY_TAG, a)
         MPI.Comm_disconnect(b)
         val err = runCatching { MPI.Wait(pending) }.exceptionOrNull()

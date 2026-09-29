@@ -14,20 +14,10 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 
-/**
- * Comunicador (Seção 3.2.3 e Capítulo 7): define um contexto de comunicação e um
- * grupo ordenado de processos. Mensagens enviadas em um contexto nunca são
- * recebidas em outro.
- *
- * - Intra-comunicador (MPI_COMM_WORLD / MPI_COMM_SELF): os processos do próprio grupo.
- * - Inter-comunicador (resultado de MPI_Comm_accept / MPI_Comm_connect, Seção 11.9):
- *   `dest` e `source` são ranks no grupo REMOTO.
- */
 class Comm internal constructor(
     val name: String,
     internal val rank: Int,
     internal val size: Int,
-    /** Tamanho do grupo remoto; 0 para intra-comunicadores. */
     internal val remoteSize: Int,
     internal val contextId: Int,
     private val channel: StreamChannel?,
@@ -35,7 +25,6 @@ class Comm internal constructor(
     internal val isInter get() = channel != null
     internal val engine = MatchingEngine()
 
-    /** Garante a ordem das mensagens (não-ultrapassagem, Seção 3.5). */
     private val sender: ExecutorService = Executors.newSingleThreadExecutor { r ->
         Thread(r, "mpi-send-$name").apply { isDaemon = true }
     }
@@ -48,7 +37,6 @@ class Comm internal constructor(
         channel?.attach(this)
     }
 
-    /** Número de processos que podem ser destino de um send neste comunicador. */
     internal val targetSize get() = if (isInter) remoteSize else size
 
     internal fun isend(msg: Message): Request {
@@ -56,7 +44,7 @@ class Comm internal constructor(
         if (freed) throw MpiException(MPI.ERR_COMM, "comunicador $name já foi desconectado")
         try {
             sender.execute { send(msg, req) }
-        } catch (e: RejectedExecutionException) { // desconectado entre a verificação e o envio
+        } catch (e: RejectedExecutionException) {
             throw MpiException(MPI.ERR_COMM, "comunicador $name já foi desconectado")
         }
         return req
@@ -64,7 +52,7 @@ class Comm internal constructor(
 
     private fun send(msg: Message, req: Request) {
         try {
-            if (channel != null) channel.write(msg) else engine.deliver(msg) // envio para si mesmo
+            if (channel != null) channel.write(msg) else engine.deliver(msg)
             req.status.MPI_SOURCE = rank
             req.status.MPI_TAG = msg.tag
             req.status.nbytes = msg.data.size
@@ -76,7 +64,6 @@ class Comm internal constructor(
         req.complete()
     }
 
-    /** MPI_Comm_disconnect: espera as comunicações pendentes e libera o comunicador. */
     @Synchronized
     internal fun disconnect() {
         if (freed) return
@@ -90,14 +77,9 @@ class Comm internal constructor(
     override fun toString() = name
 }
 
-/**
- * Requisição de uma operação não-bloqueante (Seção 3.7). Completada por
- * MPI.Wait / MPI.Test, ou cancelada por MPI.Cancel.
- */
 class Request internal constructor(internal val kind: Kind, internal val comm: Comm) {
     internal enum class Kind { SEND, RECV }
 
-    // Parâmetros de um receive: padrão de casamento do envelope (Seção 3.2.4).
     internal var buf: Any? = null
     internal var count = 0
     internal var datatype: Datatype? = null
@@ -113,7 +95,6 @@ class Request internal constructor(internal val kind: Kind, internal val comm: C
     internal fun complete() = latch.countDown()
     internal fun await() = latch.await()
 
-    /** Um receive casa com a mensagem se source, tag e contexto casam (curingas permitidos). */
     internal fun matches(m: Message) =
         m.contextId == comm.contextId &&
             (source == MPI.ANY_SOURCE || source == m.source) &&
@@ -146,11 +127,6 @@ class Request internal constructor(internal val kind: Kind, internal val comm: C
     }
 }
 
-/**
- * Motor de casamento de mensagens. Mantém a fila de mensagens inesperadas (chegaram
- * antes de um receive) e a fila de receives postados, sempre em ordem de chegada — o
- * que garante a regra de não-ultrapassagem da Seção 3.5.
- */
 internal class MatchingEngine {
     private val lock = Object()
     private val unexpected = ArrayDeque<Message>()
@@ -198,7 +174,6 @@ internal class MatchingEngine {
         removed
     }
 
-    /** MPI_Probe / MPI_Iprobe (Seção 3.8.1): consulta sem receber. */
     fun probe(contextId: Int, source: Int, tag: Int, blocking: Boolean): Status? {
         synchronized(lock) {
             while (true) {
@@ -221,7 +196,6 @@ internal class MatchingEngine {
         }
     }
 
-    /** O processo remoto saiu: todos os receives pendentes terminam com erro. */
     fun fail(e: MpiException) {
         synchronized(lock) {
             if (failure == null) failure = e
@@ -232,16 +206,6 @@ internal class MatchingEngine {
     }
 }
 
-/**
- * Canal de um inter-comunicador sobre um fluxo de bytes: um socket TCP (mesma rede) ou
- * uma sessão no relay da internet (Relay.kt). Cada mensagem vai com um cabeçalho de
- * tamanho fixo que codifica o envelope, como sugerido no "Advice to implementors" da
- * Seção 3.2.3:
- *
- *   MAGIC | tipo de quadro | contexto | source | dest | tag | datatype | nbytes | dados...
- *
- * Uma thread de progresso (Seção 2.9) lê os quadros e entrega ao motor de casamento.
- */
 internal class StreamChannel(
     input: InputStream,
     output: OutputStream,
@@ -286,7 +250,7 @@ internal class StreamChannel(
                         val dt = inp.readInt()
                         val n = inp.readInt()
                         val data = ByteArray(n).also { inp.readFully(it) }
-                        // Mensagens de outro contexto não pertencem a este comunicador.
+
                         if (ctx == comm.contextId) comm.engine.deliver(Message(ctx, src, dst, tag, dt, data))
                     }
                     Wire.FRAME_DISCONNECT -> {
@@ -324,12 +288,11 @@ internal class StreamChannel(
     }
 }
 
-/** Constantes do protocolo de rede desta implementação. */
 internal object Wire {
-    const val MAGIC = 0x4D504921 // "MPI!"
+    const val MAGIC = 0x4D504921
     const val VERSION = 1
     const val FRAME_MSG = 1
     const val FRAME_DISCONNECT = 2
-    const val FRAME_HELLO = 3   // cliente -> servidor em MPI_Comm_connect
-    const val FRAME_WELCOME = 4 // servidor -> cliente em MPI_Comm_accept
+    const val FRAME_HELLO = 3
+    const val FRAME_WELCOME = 4
 }

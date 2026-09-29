@@ -13,6 +13,8 @@ import android.os.Vibrator
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
+import android.view.WindowInsets
+import android.view.WindowInsetsController
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.view.WindowManager
@@ -31,43 +33,30 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 import kotlin.random.Random
 
-/**
- * Programa MPI de dois processos (um por celular):
- *
- *   MPI_Init_thread
- *   servidor: MPI_Open_port (rede local e internet) -> MPI_Publish_name(código) -> MPI_Comm_accept
- *   cliente : MPI_Lookup_name(código) -> MPI_Comm_connect
- *   laço:  MPI_Irecv(ANY_SOURCE, ANY_TAG) + MPI_Wait  -> mostra o sinal de fumaça
- *   toque: MPI_Send(dest = 0 do grupo remoto, tag = TAG_FUMACA)
- *   saída: MPI_Send(TAG_ADEUS), MPI_Cancel, MPI_Comm_disconnect, MPI_Finalize
- */
 class MainActivity : Activity() {
-
     companion object {
-        /** Tags distinguem os tipos de mensagem (Seção 3.2.3). */
         const val TAG_FUMACA = 1
         const val TAG_ADEUS = 2
-        /** Quantas nuvens de fumaça cada sinal tem (primeiro inteiro da mensagem). */
+
         const val NUVENS_POR_SINAL = 1
-        /** Rank do outro celular no grupo remoto do inter-comunicador. */
+
         const val OUTRO_CELULAR = 0
-        /** Letras do código da fogueira (sem 0/O, 1/I/L, que se confundem ao digitar). */
+
         private const val CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
     }
 
     @Volatile private var comm: Comm? = null
-    /** Portas abertas pelo servidor enquanto espera: uma na rede local e outra no relay da internet. */
+
     @Volatile private var openPorts: List<String> = emptyList()
-    /** Código publicado com MPI_Publish_name (o que o outro celular digita). */
+
     @Volatile private var publishedName: String? = null
-    /** Diferencia "o usuário tocou em Cancelar" de uma falha real no MPI_Comm_accept. */
+
     @Volatile private var waitCancelled = false
     @Volatile private var recvRequest: Request? = null
     private var scene: SceneView? = null
     private var fireSound: FireSound? = null
     private var sequence = 0
 
-    /** Chamadas MPI bloqueantes nunca rodam na thread de interface. */
     private val mpiThread = Executors.newSingleThreadExecutor()
 
     private lateinit var statusView: TextView
@@ -83,7 +72,30 @@ class MainActivity : Activity() {
         showSetup()
     }
 
-    // ---------------------------------------------------------------- Tela de conexão
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) hideSystemBars()
+    }
+
+    private fun hideSystemBars() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false)
+            window.insetsController?.apply {
+                hide(WindowInsets.Type.systemBars())
+                systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = (
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    or View.SYSTEM_UI_FLAG_FULLSCREEN
+                    or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                )
+        }
+    }
 
     private fun showSetup() {
         scene = null
@@ -145,7 +157,7 @@ class MainActivity : Activity() {
         thread(name = "mpi-open") {
             val ports = mutableListOf<String>()
             val lines = StringBuilder()
-            // Porta 1: TCP direto, para quem está na mesma rede (hotspot ou mesmo Wi-Fi).
+
             NetUtil.localIp()?.let { ip ->
                 try {
                     val info = MPI.Info_create()
@@ -156,7 +168,7 @@ class MainActivity : Activity() {
                 } catch (_: MpiException) {
                 }
             }
-            // Porta 2: relay pela internet, para redes diferentes (4G, outro Wi-Fi...).
+
             try {
                 val info = MPI.Info_create()
                 info.set("transport", "relay")
@@ -187,7 +199,7 @@ class MainActivity : Activity() {
                 statusView.text = "${lines}Aguardando o outro celular...\n(MPI_Comm_accept)"
                 cancelButton.visibility = View.VISIBLE
             }
-            // Um MPI_Comm_accept por porta; o primeiro cliente que chegar vence.
+
             val won = AtomicBoolean(false)
             val failures = AtomicInteger()
             for (port in ports) {
@@ -196,7 +208,7 @@ class MainActivity : Activity() {
                         val c = MPI.Comm_accept(port, MPI.INFO_NULL, 0, MPI.COMM_SELF)
                         if (won.compareAndSet(false, true)) {
                             runOnUiThread { onConnected(c, "servidor") }
-                            closeServerPorts() // o accept da outra porta falha com MPI_ERR_PORT
+                            closeServerPorts()
                         } else {
                             MPI.Comm_disconnect(c)
                         }
@@ -214,7 +226,6 @@ class MainActivity : Activity() {
         }
     }
 
-    /** MPI_Close_port nas portas de espera e MPI_Unpublish_name no código (acessa a rede). */
     @Synchronized
     private fun closeServerPorts() {
         openPorts.forEach { MPI.Close_port(it) }
@@ -225,7 +236,7 @@ class MainActivity : Activity() {
 
     private fun cancelWaiting() {
         waitCancelled = true
-        thread { closeServerPorts() } // os MPI_Comm_accept pendentes falham com MPI_ERR_PORT
+        thread { closeServerPorts() }
     }
 
     private fun startClient() {
@@ -237,7 +248,7 @@ class MainActivity : Activity() {
         if (!clientButton.isEnabled) return
         hideKeyboard()
         setBusy(true)
-        // Sem ":" é um código (nome de serviço); com ":" já é um port_name (ip:porta ou mqtts://...).
+
         val isCode = ':' !in typed
         thread(name = "mpi-connect") {
             try {
@@ -268,8 +279,6 @@ class MainActivity : Activity() {
         if (!busy) cancelButton.visibility = View.GONE
     }
 
-    // ---------------------------------------------------------------- Cena conectada
-
     private fun onConnected(c: Comm, role: String) {
         hideKeyboard()
         comm = c
@@ -288,7 +297,6 @@ class MainActivity : Activity() {
         fireSound = null
     }
 
-    /** Toque na fogueira: MPI_Send para o rank 0 do grupo remoto. */
     private fun sendSmokeSignal() {
         val c = comm ?: return
         val view = scene ?: return
@@ -304,7 +312,6 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Laço de recepção: um MPI_Irecv com curingas, completado por MPI_Wait. */
     private fun startReceiver(c: Comm) {
         thread(name = "mpi-recv", isDaemon = true) {
             val buf = IntArray(2)
@@ -353,7 +360,6 @@ class MainActivity : Activity() {
             .show()
     }
 
-    /** Sai da conversa avisando o outro lado e desfazendo o inter-comunicador. */
     private fun leave(c: Comm) {
         try {
             MPI.Send(IntArray(0), 0, MPI.INT, OUTRO_CELULAR, TAG_ADEUS, c)
@@ -391,8 +397,7 @@ class MainActivity : Activity() {
         stopFireSound()
         val c = comm
         comm = null
-        // MPI_Finalize encerra o processo MPI; depois dele não se pode chamar MPI_Init de novo,
-        // então o processo Android também termina.
+
         val cleanup = thread {
             try {
                 if (c != null) leave(c)
@@ -404,8 +409,6 @@ class MainActivity : Activity() {
         cleanup.join(2500)
         android.os.Process.killProcess(android.os.Process.myPid())
     }
-
-    // ---------------------------------------------------------------- Auxiliares
 
     private fun hideKeyboard() {
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager ?: return

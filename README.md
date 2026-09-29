@@ -1,4 +1,4 @@
-# Sinal de Fumaça — app Android seguindo o padrão MPI
+# Sinal de Fumaça - app Android seguindo o padrão MPI
 
 Dois celulares, cada um com uma montanha, o céu e uma fogueira. Quando você toca na
 fogueira, sobe um sinal de fumaça no topo da montanha **do outro celular**, e vice-versa.
